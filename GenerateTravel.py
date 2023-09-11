@@ -2,7 +2,7 @@ import numpy as np
 import time
 import datetime
 
-VELOCITY = 3.500 # km/s
+VELOCITY = 2.800 # km/s
 PATH = "./2023-02-06T011734_TURKEY/weights.dat"
 
 infile = np.genfromtxt(PATH, dtype=None)
