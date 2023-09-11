@@ -1,0 +1,267 @@
+#!/usr/bin/env python
+
+import os
+import numpy as np
+
+from mtuq import read, open_db, download_greens_tensors
+from mtuq.event import Origin
+from mtuq.graphics import plot_data_greens2, plot_beachball, plot_misfit_dc
+from mtuq.grid import DoubleCoupleGridRegular
+from mtuq.grid_search import grid_search
+from mtuq.misfit import Misfit
+from mtuq.process_data import ProcessData
+from mtuq.util import fullpath, merge_dicts, save_json
+from mtuq.util.cap import parse_station_codes, Trapezoid
+
+
+
+if __name__=='__main__':
+    #
+    # Carries out grid search over 64,000 double couple moment tensors
+    #
+    # USAGE
+    #   mpirun -n <NPROC> python GridSearch.DoubleCouple.py
+    #
+    # For a simpler example, see SerialGridSearch.DoubleCouple.py, 
+    # which runs the same inversion in serial
+    #
+
+
+    #
+    # We will investigate the source process of an Mw~4 earthquake using data
+    # from a regional seismic array
+    #
+
+    path_data=    fullpath('/home/jovyan/turkey/2023-02-06T011734_TURKEY/SAC/*.sac')
+    path_weights= fullpath('/home/jovyan/turkey/2023-02-06T011734_TURKEY/weights.dat')
+    event_id=     '20230206011734000'
+    model=        'ak135'
+
+    #
+    # For our objective function, we will use a sum of body and surface wave
+    # contributions
+    #
+
+    misfit_bw = Misfit(
+        norm='L2',
+        time_shift_min=-2.,
+        time_shift_max=+2.,
+        time_shift_groups=['ZR'],
+        )
+
+    misfit_sw = Misfit(
+        norm='L2',
+        time_shift_min=-10.,
+        time_shift_max=+10.,
+        time_shift_groups=['ZR','T'],
+        )
+
+
+    #
+    # User-supplied weights control how much each station contributes to the
+    # objective function
+    #
+
+    station_id_list = parse_station_codes(path_weights)
+
+
+    #
+    # Next, we specify the moment tensor grid and source-time function
+    #
+
+    grid = DoubleCoupleGridRegular(
+        npts_per_axis=40,
+        magnitudes=[7.8])
+
+    wavelet = Trapezoid(
+        magnitude=7.8)
+
+
+    #
+    # Origin time and location will be fixed. For an example in which they 
+    # vary, see examples/GridSearch.DoubleCouple+Magnitude+Depth.py
+    #
+    # See also Dataset.get_origins(), which attempts to create Origin objects
+    # from waveform metadata
+    #
+
+    origin = Origin({
+        'time': '2023-02-06T01:17:3Z',
+        'latitude': 37.225,
+        'longitude': 37.021,
+        'depth_in_m': 10000.0,
+        })
+
+
+    from mpi4py import MPI
+    comm = MPI.COMM_WORLD
+
+    #
+    # Body and surface wave measurements will be made separately
+    #
+    
+    body_mins = np.arange(80, 120, 10)
+    body_maxs = np.arange(30, 80, 10)
+    #body_mins = [80]
+    #body_maxs = [30]
+    
+    surf_mins = np.arange(120, 220, 20)
+    surf_maxs = np.arange(40, 90, 10)
+    #surf_mins = [150]
+    #surf_maxs = [50]
+    
+    processes_bw = []
+    processes_sw = []
+    
+    for body_min in body_mins:
+        for body_max in body_maxs:
+            for surf_min in surf_mins:
+                for surf_max in surf_maxs:
+                
+                    process_bw = ProcessData( # freq 31 81 sec window: 81 to 111
+                        filter_type='Bandpass',
+                        freq_min= 1/body_min,  
+                        freq_max= 1/body_max,
+                        pick_type='taup',
+                        taup_model=model,
+                        window_type='body_wave',
+                        window_length=body_min*1.5,  
+                        capuaf_file=path_weights,
+                        )
+
+                    process_sw = ProcessData( # 51   211 sec
+                        filter_type='Bandpass',
+                        freq_min= 1/surf_min,  
+                        freq_max= 1/surf_max,
+                        pick_type='user_supplied',
+                        taup_model=model,
+                        window_type='surface_wave',
+                        window_length=surf_min*1.5,
+                        capuaf_file='/home/jovyan/turkey/newweights.dat',
+                        )
+                    
+                    processes_bw.append(process_bw)
+                    processes_sw.append(process_sw)
+    
+    #
+    # The main I/O work starts now
+    #
+    if comm.rank==0:
+        print('Reading data...\n')
+        data = read(path_data, format='sac', 
+            event_id=event_id,
+            station_id_list=station_id_list,
+            tags=['units:cm', 'type:displacement']) 
+
+
+        data.sort_by_distance()
+        stations = data.get_stations()
+
+        print('Reading Greens functions...\n')
+        greens = download_greens_tensors(stations, origin, model)
+        greens.convolve(wavelet)
+        
+        print('and so it begins\n')
+        
+        resultses_sw = None
+        resultses_bw = None
+        idx = None
+        gpbw = None
+        gpsw = None
+        gdbw = None
+        gdsw = None
+        ggbw = None
+        ggsw = None
+        
+        for i in range(len(processes_bw)):
+            print('Processing data {} of {}\n'.format(i+1, len(processes_bw)))
+            data_bw = data.map(processes_bw[i])
+            data_sw = data.map(processes_sw[i])
+
+            print('Processing Greens functions {} of {}\n'.format(i+1, len(processes_bw)))
+            greens_bw = greens.map(processes_bw[i])
+            greens_sw = greens.map(processes_sw[i])
+
+            stations = comm.bcast(stations, root=0)
+            data_bw = comm.bcast(data_bw, root=0)
+            data_sw = comm.bcast(data_sw, root=0)
+            greens_bw = comm.bcast(greens_bw, root=0)
+            greens_sw = comm.bcast(greens_sw, root=0)
+
+            print('Evaluating body wave misfit {} of {}\n'.format(i+1, len(processes_bw)))
+
+            results_bw = grid_search(
+                data_bw, greens_bw, misfit_bw, origin, grid)
+
+            print('Evaluating surface wave misfit {} of {}\n'.format(i+1, len(processes_bw)))
+
+            results_sw = grid_search(
+                data_sw, greens_sw, misfit_sw, origin, grid)
+            
+            if idx is None:
+                resultses_bw = results_bw 
+                resultses_sw = results_sw
+                results = resultses_bw + resultses_sw
+                idx = results.idxmin('source')
+                gpbw = processes_bw[i]
+                gpsw = processes_sw[i]
+                gdbw = data_bw
+                gdsw = data_sw
+                ggbw = greens_bw
+                ggsw = greens_sw
+            else:
+                resultses_bw += results_bw 
+                resultses_sw += results_sw
+                results = resultses_bw + resultses_sw
+                temp_idx = results.idxmin('source')
+                if temp_idx != idx:
+                    idx = temp_idx
+                    gpbw = processes_bw[i]
+                    gpsw = processes_sw[i]
+                    gdbw = data_bw
+                    gdsw = data_sw
+                    ggbw = greens_bw
+                    ggsw = greens_sw
+
+        # array index corresponding to minimum misfit
+        results = resultses_bw + resultses_sw
+        idx = results.idxmin('source')
+
+        best_source = grid.get(idx)
+        lune_dict = grid.get_dict(idx)
+        mt_dict = grid.get(idx).as_dict()
+
+
+        #
+        # Generate figures and save results
+        #
+
+        print('Generating figures...\n')
+        
+        plot_data_greens2(event_id+'DC_waveforms.png',
+            gdbw, gdsw, ggbw, ggsw, gpbw, gpsw, 
+            misfit_bw, misfit_sw, stations, origin, best_source, lune_dict)
+        
+        plot_beachball(event_id+'DC_beachball.png',
+            best_source, stations, origin)
+
+
+        plot_misfit_dc(event_id+'DC_misfit.png', results)
+
+
+        print('Saving results...\n')
+
+        merged_dict = merge_dicts(lune_dict, mt_dict, origin,
+            {'M0': best_source.moment(), 'Mw': best_source.magnitude()})
+
+
+        # save best-fitting source
+        save_json(event_id+'DC_solution.json', merged_dict)
+
+
+        # save misfit surface
+        results.save(event_id+'DC_misfit.nc')
+
+
+        print('\nFinished\n')
+
